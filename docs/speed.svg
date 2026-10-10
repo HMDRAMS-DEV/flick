@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="210" viewBox="0 0 720 210" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif">
+  <style>
+    .label { font-size: 15px; fill: #8b8b8b; }
+    .value { font-size: 15px; fill: #8b8b8b; font-variant-numeric: tabular-nums; }
+    .flick { font-weight: 600; fill: #E8590C; }
+    .caption { font-size: 12.5px; fill: #8b8b8b; }
+  </style>
+  <!-- Scale: 390 ms = 470 px. -->
+  <text class="label flick" x="0" y="38">Flick</text>
+  <rect x="190" y="24" width="36" height="20" fill="#E8590C"/>
+  <text class="value flick" x="235" y="39">30 ms</text>
+
+  <text class="label" x="0" y="88">Full JPEG decode</text>
+  <rect x="190" y="74" width="470" height="20" fill="#8b8b8b" opacity="0.45"/>
+  <text class="value" x="668" y="89">390 ms</text>
+
+  <text class="label" x="0" y="138">Next photo, prefetched</text>
+  <rect x="190" y="124" width="2" height="20" fill="#E8590C"/>
+  <text class="value flick" x="200" y="139">next frame</text>
+
+  <text class="caption" x="0" y="182">Time to put a 23 MP Sigma BF JPEG on screen, read cold from the camera over USB (~36 MB/s).</text>
+  <text class="caption" x="0" y="200">Median of 20 photos, two runs, on an M4 Max. Prefetch keeps the next 8 photos ready.</text>
+</svg>
