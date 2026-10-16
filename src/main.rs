@@ -2,6 +2,7 @@
 
 mod app;
 mod decode;
+mod fix;
 mod library;
 mod loader;
 mod store;
@@ -10,6 +11,11 @@ use std::path::PathBuf;
 
 fn main() -> eframe::Result {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The tools Claude uses during a fix, served to `claude -p` (see fix.rs).
+    if args.first().map(String::as_str) == Some("--mcp") {
+        fix::serve(std::path::Path::new(args.get(1).expect("usage: flick --mcp <session dir>")));
+        return Ok(());
+    }
     if args.first().map(String::as_str) == Some("--bench") {
         bench(args.get(1).map(PathBuf::from).expect("usage: flick --bench <folder>"));
         return Ok(());

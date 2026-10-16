@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 
 use eframe::egui::{
@@ -8,6 +10,7 @@ use eframe::egui::{
 };
 
 use crate::decode::{Meta, Size};
+use crate::fix::{self, Params};
 use crate::library::{self, Kind, Photo, human_bytes};
 use crate::loader::{Job, Loader};
 use crate::store::{self, Decision};
@@ -41,6 +44,49 @@ const GAP: f32 = 4.0;
 const AHEAD: usize = 8;
 const BEHIND: usize = 3;
 
+/// A "Fix with Claude": the request being written, Claude at work, or a result waiting to
+/// be saved, refined or discarded.
+struct Fix {
+    id: u32,
+    session: Arc<fix::Session>,
+    /// Stops Claude's run in progress, if any.
+    cancel: Arc<AtomicBool>,
+    rx: Receiver<FixMsg>,
+    state: FixState,
+    /// Claude's latest adjustments and their preview. A follow-up request refines them.
+    result: Option<(Params, TextureHandle)>,
+    history: Vec<fix::Round>,
+    /// The request being typed or dictated.
+    draft: String,
+    /// What the draft held when dictation started; the transcript goes after it.
+    draft_base: String,
+    listen: Option<fix::Listener>,
+    /// The request Claude is working on, recorded with its answer.
+    asked: String,
+}
+
+impl Drop for Fix {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(PartialEq)]
+enum FixState {
+    Asking,
+    Working(String),
+    Ready,
+    Saving,
+    Failed(String),
+}
+
+enum FixMsg {
+    Step(String),
+    Ready(Params, egui::ColorImage),
+    Saved(PathBuf, u64),
+    Failed(String),
+}
+
 #[derive(PartialEq)]
 enum Screen {
     Start,
@@ -59,6 +105,7 @@ pub struct App {
     undo: Vec<(usize, Option<Decision>)>,
     zoom: bool,
     help: bool,
+    fix: Option<Fix>,
     /// When the current photo last changed; full resolution is prefetched once it settles.
     cur_since: f64,
 
@@ -92,6 +139,7 @@ impl App {
             undo: vec![],
             zoom: false,
             help: false,
+            fix: None,
             cur_since: 0.0,
             loader: Loader::new(cc.egui_ctx.clone()),
             requested: HashSet::new(),
@@ -141,6 +189,7 @@ impl App {
         self.last_wish.clear();
         self.undo.clear();
         self.zoom = false;
+        self.fix = None;
         self.decisions = store::load_decisions(&root);
         self.photos = photos;
         self.reindex();
@@ -160,6 +209,7 @@ impl App {
 
     fn close(&mut self) {
         self.screen = Screen::Start;
+        self.fix = None;
         self.photos.clear();
         self.root = None;
         self.cards = store::cards();
@@ -213,20 +263,33 @@ impl App {
         let (mut k, mut d) = (0, 0);
         for p in &self.photos {
             match self.decisions.get(&p.key) {
-                Some(Decision::Keep) => k += 1,
                 Some(Decision::Delete) => d += 1,
+                Some(_) => k += 1,
                 None => {}
             }
         }
         (k, d, self.photos.len() - k - d)
     }
 
+    /// Photos with files to remove at review: marked Delete, or one half of a RAW + JPEG pair.
     fn marked(&self) -> Vec<usize> {
-        (0..self.photos.len()).filter(|&i| self.decision(i) == Some(Decision::Delete)).collect()
+        (0..self.photos.len()).filter(|&i| !self.removal(i).is_empty()).collect()
+    }
+
+    /// Files photo `i`'s decision removes at review.
+    fn removal(&self, i: usize) -> Vec<(PathBuf, u64)> {
+        let p = &self.photos[i];
+        match self.decision(i) {
+            Some(Decision::Delete) => p.files.clone(),
+            Some(Decision::KeepJpeg) if p.is_pair() => p.drop_half(true),
+            Some(Decision::KeepRaw) if p.is_pair() => p.drop_half(false),
+            _ => vec![],
+        }
     }
 
     fn go(&mut self, i: usize) {
-        if self.photos.is_empty() {
+        // A fix belongs to the photo it was started on.
+        if self.photos.is_empty() || self.fix.is_some() {
             return;
         }
         let i = i.min(self.photos.len() - 1);
@@ -257,36 +320,60 @@ impl App {
         self.flash("Nothing left undecided.");
     }
 
-    /// Permanently removes every file of every photo marked Delete.
+    /// Permanently removes every file of every photo marked Delete, and the dropped half
+    /// of every RAW + JPEG pair marked J or R.
     fn delete_marked(&mut self) {
         let marked = self.marked();
         if marked.is_empty() {
             return;
         }
         let mut removed: HashSet<u32> = HashSet::new();
-        let mut freed = 0u64;
+        let (mut halves, mut freed) = (0usize, 0u64);
         let mut errors: Vec<String> = vec![];
-        for &i in &marked {
-            let p = &self.photos[i];
-            let mut ok = true;
-            for f in &p.files {
+        for i in marked {
+            let whole = self.decision(i) == Some(Decision::Delete);
+            let mut gone: Vec<PathBuf> = vec![];
+            for (f, size) in self.removal(i) {
                 // exFAT cards keep macOS metadata in "._<name>" companions; remove those too.
                 if let (Some(dir), Some(name)) = (f.parent(), f.file_name()) {
                     let _ = std::fs::remove_file(dir.join(format!("._{}", name.to_string_lossy())));
                 }
-                match std::fs::remove_file(f) {
-                    Ok(()) => {}
+                match std::fs::remove_file(&f) {
+                    Ok(()) => freed += size,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
-                        ok = false;
                         errors.push(format!("{}: {e}", f.display()));
+                        continue;
                     }
                 }
+                gone.push(f);
             }
-            if ok {
-                removed.insert(p.id);
-                freed += p.bytes;
+            let p = &mut self.photos[i];
+            if whole {
+                if gone.len() == p.files.len() {
+                    removed.insert(p.id);
+                }
+                continue;
             }
+            if gone.is_empty() {
+                continue;
+            }
+            halves += 1;
+            p.files.retain(|f| !gone.contains(&f.0));
+            p.bytes = p.files.iter().map(|f| f.1).sum();
+            let old_key = p.key.clone();
+            if gone.contains(&p.primary)
+                && let Some(raw) = p.raw().map(Path::to_path_buf)
+            {
+                // The JPEG was the primary; the raw takes over, and so does its key.
+                p.key = self.root.as_ref().and_then(|r| raw.strip_prefix(r).ok()).unwrap_or(&raw).to_string_lossy().into_owned();
+                p.name = raw.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                p.primary = raw;
+                p.kind = Kind::Raw;
+            }
+            let new_key = p.key.clone();
+            self.decisions.remove(&old_key);
+            self.decisions.insert(new_key, Decision::Keep);
         }
         let cur_id = self.photos.get(self.cur).map(|p| p.id);
         for p in self.photos.iter().filter(|p| removed.contains(&p.id)) {
@@ -310,7 +397,12 @@ impl App {
             .unwrap_or_else(|| self.photos.iter().position(|p| !self.decisions.contains_key(&p.key)).unwrap_or(0))
             .min(self.photos.len().saturating_sub(1));
         self.screen = Screen::Cull;
-        let msg = format!("Deleted {} photos, freed {}", removed.len(), human_bytes(freed));
+        let what = match (removed.len(), halves) {
+            (d, 0) => format!("Deleted {d} photos"),
+            (0, h) => format!("Dropped {h} RAW / JPEG copies"),
+            (d, h) => format!("Deleted {d} photos and {h} RAW / JPEG copies"),
+        };
+        let msg = format!("{what}, freed {}", human_bytes(freed));
         if errors.is_empty() {
             self.flash(msg);
         } else {
@@ -421,7 +513,8 @@ impl App {
             .filter(|k| !self.requested.contains(k))
             .map(|&(id, size)| {
                 let p = &self.photos[self.index_of[&id]];
-                Job { id, size, path: p.primary.clone(), kind: p.kind }
+                let (path, kind) = p.shown();
+                Job { id, size, path: path.to_path_buf(), kind }
             })
             .collect();
         for j in self.loader.replace(jobs.clone()) {
@@ -448,9 +541,10 @@ impl App {
             self.open(path, ctx);
             return;
         }
+        let asking = self.asking();
         for ev in events {
             match ev {
-                Event::Text(t) if t == "?" => self.help = !self.help,
+                Event::Text(t) if t == "?" && !asking => self.help = !self.help,
                 Event::Key { key, pressed: true, repeat, modifiers, .. } => {
                     self.key(ctx, key, repeat, modifiers);
                 }
@@ -460,6 +554,13 @@ impl App {
     }
 
     fn key(&mut self, ctx: &egui::Context, key: Key, repeat: bool, m: egui::Modifiers) {
+        // While writing a request, letters are text, not shortcuts.
+        if self.asking() {
+            if !repeat {
+                self.key_fix(ctx, key, m);
+            }
+            return;
+        }
         let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
         if key == Key::F && !m.command {
             ctx.send_viewport_cmd(ViewportCommand::Fullscreen(!fullscreen));
@@ -480,6 +581,13 @@ impl App {
             return;
         }
 
+        if self.fix.is_some() && self.screen == Screen::Cull {
+            if !repeat {
+                self.key_fix(ctx, key, m);
+            }
+            return;
+        }
+
         match self.screen {
             Screen::Start => self.key_start(ctx, key),
             Screen::Review => match key {
@@ -495,6 +603,15 @@ impl App {
                     Key::Space => self.step(if m.shift { -1 } else { 1 }),
                     Key::ArrowUp | Key::K | Key::P if decide_ok => self.decide(Decision::Keep),
                     Key::ArrowDown | Key::X | Key::D if decide_ok => self.decide(Decision::Delete),
+                    Key::J | Key::R if decide_ok => {
+                        if self.photos.get(self.cur).is_some_and(Photo::is_pair) {
+                            self.decide(if key == Key::J { Decision::KeepJpeg } else { Decision::KeepRaw });
+                        } else {
+                            self.flash("This photo is not a RAW + JPEG pair.");
+                        }
+                    }
+                    Key::E if !repeat => self.start_fix(ctx, false),
+                    Key::V if !repeat => self.start_fix(ctx, true),
                     Key::U | Key::Num0 => self.set_decision(self.cur, None, true),
                     Key::Z if m.command => self.undo(),
                     Key::Backspace if !m.command => self.undo(),
@@ -529,6 +646,207 @@ impl App {
         }
     }
 
+    // ---------- fix with Claude ----------
+
+    fn asking(&self) -> bool {
+        self.screen == Screen::Cull && self.fix.as_ref().is_some_and(|f| f.state == FixState::Asking)
+    }
+
+    /// Opens the request box for the current photo, listening right away if `voice`.
+    fn start_fix(&mut self, ctx: &egui::Context, voice: bool) {
+        let Some(p) = self.photos.get(self.cur) else { return };
+        if p.kind == Kind::Video {
+            self.flash("Claude fixes photos, not videos.");
+            return;
+        }
+        let session = match fix::Session::new(&fix::source(p)) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                self.flash(format!("Could not start the fix: {e}"));
+                return;
+            }
+        };
+        let (_, rx) = std::sync::mpsc::channel();
+        self.zoom = false;
+        self.fix = Some(Fix {
+            id: p.id,
+            session,
+            cancel: Arc::default(),
+            rx,
+            state: FixState::Asking,
+            result: None,
+            history: vec![],
+            draft: String::new(),
+            draft_base: String::new(),
+            listen: None,
+            asked: String::new(),
+        });
+        if voice {
+            self.toggle_mic(ctx);
+        }
+    }
+
+    fn toggle_mic(&mut self, ctx: &egui::Context) {
+        let Some(f) = &mut self.fix else { return };
+        match &mut f.listen {
+            Some(l) if !l.stopping() => l.stop(),
+            _ => {
+                let ctx = ctx.clone();
+                match fix::Listener::start(move || ctx.request_repaint()) {
+                    Ok(l) => {
+                        f.draft_base = f.draft.trim_end().to_string();
+                        f.listen = Some(l);
+                    }
+                    Err(e) => self.flash(e),
+                }
+            }
+        }
+    }
+
+    /// Sends the draft to Claude, with the earlier rounds if this is a follow-up.
+    fn ask(&mut self, ctx: &egui::Context) {
+        let Some(f) = &mut self.fix else { return };
+        f.listen = None;
+        f.asked = f.draft.trim().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        f.cancel.store(true, Ordering::Relaxed);
+        f.cancel = Arc::default();
+        let (session, cancel, asked, history) = (f.session.clone(), f.cancel.clone(), f.asked.clone(), f.history.clone());
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let send = |m| {
+                let _ = tx.send(m);
+                ctx.request_repaint();
+            };
+            let msg = match fix::analyze(&session, &asked, &history, &|s| send(FixMsg::Step(s)), &cancel) {
+                Ok(params) => {
+                    send(FixMsg::Step("Rendering the final edit…".into()));
+                    match fix::preview(&session, &params) {
+                        Ok(img) => {
+                            let size = [img.width() as usize, img.height() as usize];
+                            FixMsg::Ready(params, egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()))
+                        }
+                        Err(e) => FixMsg::Failed(e),
+                    }
+                }
+                Err(e) => FixMsg::Failed(e),
+            };
+            send(msg);
+        });
+        f.rx = rx;
+        let what = if f.history.is_empty() { "Claude is looking at the photo…" } else { "Claude is reworking it…" };
+        f.state = FixState::Working(what.into());
+    }
+
+    fn key_fix(&mut self, ctx: &egui::Context, key: Key, m: egui::Modifiers) {
+        let Some(f) = &mut self.fix else { return };
+        // Back to the last result if there is one, else out of the fix.
+        let back = |f: &mut Fix| {
+            f.listen = None;
+            f.cancel.store(true, Ordering::Relaxed);
+            // A run still going reports into a channel no one reads.
+            f.rx = std::sync::mpsc::channel().1;
+            f.state = FixState::Ready;
+            f.result.is_some()
+        };
+        match (&f.state, key) {
+            (FixState::Asking, Key::Enter) => self.ask(ctx),
+            (FixState::Asking, Key::D) if m.command => self.toggle_mic(ctx),
+            (FixState::Asking | FixState::Working(_) | FixState::Failed(_), Key::Escape) => {
+                if !back(f) {
+                    self.fix = None;
+                }
+            }
+            (FixState::Ready | FixState::Failed(_), Key::E | Key::V) => {
+                // A failed request stays in the box to edit; after a result, start fresh.
+                if f.state == FixState::Ready {
+                    f.draft.clear();
+                }
+                f.state = FixState::Asking;
+                if key == Key::V {
+                    self.toggle_mic(ctx);
+                }
+            }
+            (FixState::Ready, Key::Enter | Key::ArrowUp) => {
+                let Some((params, _)) = &f.result else { return };
+                let Some(&i) = self.index_of.get(&f.id) else { return };
+                let (tx, rx) = std::sync::mpsc::channel();
+                let (session, dest, params) = (f.session.clone(), fix::fixed_path(&self.photos[i]), params.clone());
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(match fix::save(&session, &dest, &params) {
+                        Ok(bytes) => FixMsg::Saved(dest, bytes),
+                        Err(e) => FixMsg::Failed(e),
+                    });
+                    ctx.request_repaint();
+                });
+                f.rx = rx;
+                f.state = FixState::Saving;
+            }
+            (FixState::Ready, Key::Escape | Key::ArrowDown | Key::Backspace) => self.fix = None,
+            _ => {}
+        }
+    }
+
+    fn pump_fix(&mut self, ctx: &egui::Context) {
+        let Some(f) = &mut self.fix else { return };
+        if let Some(l) = &f.listen {
+            loop {
+                match l.rx.try_recv() {
+                    Ok(fix::Heard::Text(t)) => {
+                        f.draft = if f.draft_base.is_empty() { t } else { format!("{} {t}", f.draft_base) };
+                    }
+                    Ok(fix::Heard::Failed(e)) => {
+                        f.listen = None;
+                        self.flash(e);
+                        return;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        f.listen = None;
+                        break;
+                    }
+                }
+            }
+        }
+        while let Ok(m) = f.rx.try_recv() {
+            match m {
+                FixMsg::Step(s) => f.state = FixState::Working(s),
+                FixMsg::Ready(params, img) => {
+                    let tex = ctx.load_texture("fix", img, TextureOptions::LINEAR);
+                    f.history.push(fix::Round { feedback: f.asked.clone(), params: params.clone() });
+                    f.result = Some((params, tex));
+                    f.state = FixState::Ready;
+                }
+                FixMsg::Failed(e) => f.state = FixState::Failed(e),
+                FixMsg::Saved(path, bytes) => {
+                    let id = f.id;
+                    self.fix = None;
+                    self.saved_fix(id, path, bytes);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The fix is now part of the shot: shown in place of the original, deleted with it.
+    fn saved_fix(&mut self, id: u32, path: PathBuf, bytes: u64) {
+        let Some(&i) = self.index_of.get(&id) else { return };
+        let p = &mut self.photos[i];
+        p.files.retain(|f| f.0 != path);
+        p.files.push((path.clone(), bytes));
+        p.bytes = p.files.iter().map(|f| f.1).sum();
+        p.edit = Some(path.clone());
+        self.thumbs.remove(&id);
+        self.previews.remove(&id);
+        self.meta.remove(&id);
+        self.full = None;
+        self.failed.retain(|k| k.0 != id);
+        self.requested.retain(|k| k.0 != id);
+        self.last_wish.clear();
+        self.flash(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
+    }
+
     fn open_review(&mut self) {
         if self.marked().is_empty() {
             self.flash("Nothing marked for deletion.");
@@ -548,6 +866,7 @@ impl eframe::App for App {
             self.finish_scan(root, photos);
         }
         self.pump_loader(&ctx);
+        self.pump_fix(&ctx);
         self.handle_input(&ctx);
 
         let full = ui.max_rect();
@@ -612,6 +931,12 @@ impl App {
         if let Some(ph) = self.photos.get(self.cur).filter(|_| self.screen == Screen::Cull) {
             let meta = self.meta.get(&ph.id);
             let mut s = ph.name.clone();
+            if let Some(raw) = ph.raw().filter(|_| ph.is_pair()) {
+                s = format!("{s} + {}", raw.extension().unwrap_or_default().to_string_lossy().to_uppercase());
+            }
+            if ph.edit.is_some() {
+                s = format!("{s}  (fixed)");
+            }
             if let Some(m) = meta
                 && !m.exposure.is_empty()
             {
@@ -714,12 +1039,20 @@ impl App {
         // Photo stage.
         let ph = &self.photos[self.cur];
         let id = ph.id;
+        let ph_pair = ph.is_pair();
         let area = stage.shrink(12.0);
         let resp = ui.interact(stage, ui.id().with("stage"), Sense::click());
-        if resp.clicked() {
+        if resp.clicked() && self.fix.is_none() {
             self.zoom = !self.zoom;
         }
-        let tex = self.full.as_ref().filter(|f| f.0 == id).map(|f| &f.1)
+        // Holding B during a fix shows the original for comparison.
+        let before = !self.asking() && ui.ctx().input(|i| i.key_down(Key::B));
+        let fixed = match &self.fix {
+            Some(Fix { id: fid, result: Some((_, t)), .. }) if *fid == id && !before => Some(t),
+            _ => None,
+        };
+        let tex = fixed
+            .or_else(|| self.full.as_ref().filter(|f| f.0 == id).map(|f| &f.1))
             .or_else(|| self.previews.get(&id))
             .or_else(|| self.thumbs.get(&id));
 
@@ -743,19 +1076,26 @@ impl App {
             };
             p.with_clip_rect(stage).image(tex.id(), rect, Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
 
-            if !self.zoom {
+            if self.asking() {
+                self.draw_ask(ui, stage, fitted);
+            } else if self.fix.is_some() {
+                self.draw_fix(&p, stage, fitted, before);
+            } else if !self.zoom {
                 if let Some(d) = self.decision(self.cur) {
                     let (c, label) = match d {
                         Decision::Keep => (KEEP, "KEEP"),
+                        Decision::KeepJpeg => (KEEP, "KEEP JPEG"),
+                        Decision::KeepRaw => (KEEP, "KEEP RAW"),
                         Decision::Delete => (DELETE, "DELETE"),
                     };
                     if d == Decision::Delete {
                         p.rect_filled(fitted, 0.0, Color32::from_black_alpha(110));
                     }
                     p.rect_stroke(fitted, 0.0, Stroke::new(3.0, c), StrokeKind::Inside);
-                    let tag = Rect::from_min_size(fitted.min + vec2(12.0, 12.0), vec2(if d == Decision::Keep { 62.0 } else { 84.0 }, 28.0));
+                    let galley = p.layout_no_wrap(label.into(), font(12.5), Color32::BLACK);
+                    let tag = Rect::from_min_size(fitted.min + vec2(12.0, 12.0), vec2(galley.size().x + 24.0, 28.0));
                     p.rect_filled(tag, 0.0, c);
-                    p.text(tag.center(), Align2::CENTER_CENTER, label, font(12.5), Color32::BLACK);
+                    p.galley(tag.center() - galley.size() / 2.0, galley, Color32::BLACK);
                 }
             } else if self.full.as_ref().is_none_or(|f| f.0 != id) && ph.kind != Kind::Video {
                 p.text(stage.left_bottom() + vec2(14.0, -14.0), Align2::LEFT_BOTTOM, "Loading full resolution…", font(12.0), TEXT);
@@ -770,7 +1110,7 @@ impl App {
             };
             p.text(stage.center(), Align2::CENTER_CENTER, msg, font(15.0), DIM);
             if let Some(d) = self.decision(self.cur) {
-                let c = if d == Decision::Keep { KEEP } else { DELETE };
+                let c = if d.keeps() { KEEP } else { DELETE };
                 p.rect_stroke(area, 0.0, Stroke::new(3.0, c), StrokeKind::Inside);
             }
         }
@@ -798,7 +1138,7 @@ impl App {
                 p.image(t.id(), Rect::from_center_size(cell.center(), ts * s), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
             }
             if let Some(d) = dec {
-                let c = if d == Decision::Keep { KEEP } else { DELETE };
+                let c = if d.keeps() { KEEP } else { DELETE };
                 p.rect_filled(Rect::from_min_size(pos2(cell.left(), cell.bottom() + 4.0), vec2(CELL.x, 3.0)), 0.0, c);
             }
             if i == self.cur {
@@ -817,10 +1157,111 @@ impl App {
         }
 
         // Key hints.
-        let hints = "←  →  browse      ↑ / K  keep      ↓ / X  delete      Z  zoom      Tab  next undecided      ⌫  undo      Enter  review & delete      H  help";
+        let hints = match &self.fix {
+            Some(Fix { state: FixState::Asking, listen, .. }) => {
+                let mic = if listen.is_some() { "⌘D  stop listening" } else { "⌘D  speak" };
+                format!("Enter  send to Claude      {mic}      Esc  cancel")
+            }
+            Some(Fix { state: FixState::Ready, .. }) => format!(
+                "Enter / ↑  save as {}      E  type / V  say what to change      hold B  original      Esc / ↓  discard",
+                self.fix_name()
+            ),
+            Some(Fix { state: FixState::Saving, .. }) => format!("Saving {}…", self.fix_name()),
+            Some(Fix { state: FixState::Failed(_), .. }) => "E / V  try another request      Esc  close".into(),
+            Some(_) => "Esc  cancel".into(),
+            None => {
+                let pair = if ph_pair { "J / R  keep JPEG / RAW only      " } else { "" };
+                format!("←  →  browse      ↑ / K  keep      ↓ / X  delete      {pair}E / V  fix with Claude (type / say)      Z  zoom      ⌫  undo      Enter  review & delete      H  help")
+            }
+        };
         p.text(hint.center(), Align2::CENTER_CENTER, hints, font(12.0), DIM);
 
         (lo as usize, hi as usize)
+    }
+
+    fn fix_name(&self) -> String {
+        let p = self.fix.as_ref().and_then(|f| self.index_of.get(&f.id)).map(|&i| fix::fixed_path(&self.photos[i]));
+        p.and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_default()
+    }
+
+    /// Claude's verdict over the bottom of the photo, or progress while it works.
+    fn draw_fix(&self, p: &egui::Painter, stage: Rect, fitted: Rect, before: bool) {
+        let Some(f) = &self.fix else { return };
+        let (title, body, color) = match (&f.state, &f.result) {
+            (FixState::Working(s), _) => {
+                let body = if f.asked.is_empty() { "Claude edits, renders and checks its work. Usually under a minute.".to_string() } else { format!("“{}”", f.asked) };
+                (s.clone(), body, DIM)
+            }
+            (FixState::Failed(e), _) => ("Claude could not fix this photo".to_string(), e.clone(), DELETE),
+            (_, Some((params, _))) => {
+                let title = if before { "Original".to_string() } else { format!("Claude:  {}", params.describe()) };
+                (title, params.summary.clone(), ACCENT)
+            }
+            _ => return,
+        };
+        p.rect_stroke(fitted, 0.0, Stroke::new(3.0, color), StrokeKind::Inside);
+        let w = (stage.width() - 80.0).min(900.0);
+        let title = p.layout(title, font(14.0), TEXT, w - 36.0);
+        let body = p.layout(body, font(13.0), DIM, w - 36.0);
+        let h = title.size().y + body.size().y + 36.0;
+        let r = Rect::from_min_size(pos2(stage.center().x - w / 2.0, stage.bottom() - h - 24.0), vec2(w, h));
+        p.rect_filled(r, 0.0, Color32::from_black_alpha(215));
+        let t = r.min + vec2(18.0, 14.0);
+        let th = title.size().y;
+        p.galley(t, title, TEXT);
+        p.galley(t + vec2(0.0, th + 8.0), body, DIM);
+    }
+
+    /// The request box over the bottom of the photo: a text field and a mic button.
+    fn draw_ask(&mut self, ui: &mut egui::Ui, stage: Rect, fitted: Rect) {
+        let refining = self.fix.as_ref().is_some_and(|f| f.result.is_some());
+        let Some(f) = &mut self.fix else { return };
+        let p = ui.painter().clone();
+        let listening = f.listen.as_ref().is_some_and(|l| !l.stopping());
+        p.rect_stroke(fitted, 0.0, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
+
+        let w = (stage.width() - 80.0).min(900.0);
+        let mic = 44.0;
+        let r = Rect::from_min_size(pos2(stage.center().x - w / 2.0, stage.bottom() - 150.0 - 24.0), vec2(w, 150.0));
+        p.rect_filled(r, 0.0, Color32::from_black_alpha(225));
+        let title = if refining { "What should Claude change?" } else { "What should Claude fix?" };
+        p.text(r.min + vec2(18.0, 14.0), Align2::LEFT_TOP, title, font(14.0), TEXT);
+
+        let field = Rect::from_min_max(r.min + vec2(18.0, 44.0), r.max - vec2(18.0 + mic + 14.0, 14.0));
+        let hint = if refining {
+            "e.g. too warm now, and bring back some contrast"
+        } else {
+            "e.g. the sky is blown out and her face is too dark. Leave empty to let Claude decide."
+        };
+        let edit = egui::TextEdit::multiline(&mut f.draft)
+            .font(font(14.0))
+            .text_color(TEXT)
+            .hint_text(egui::RichText::new(hint).color(FAINT))
+            .frame(egui::Frame::NONE)
+            .desired_width(field.width())
+            .interactive(!listening);
+        let resp = ui.put(field, edit);
+        if !listening {
+            resp.request_focus();
+        }
+
+        // Mic button: red while listening.
+        let m = Rect::from_center_size(pos2(r.right() - 18.0 - mic / 2.0, field.top() + mic / 2.0), Vec2::splat(mic));
+        let click = ui.interact(m, ui.id().with("mic"), Sense::click());
+        let fill = if listening { DELETE } else if click.hovered() { FAINT } else { Color32::from_gray(45) };
+        p.circle_filled(m.center(), mic / 2.0, fill);
+        draw_mic_glyph(&p, m.center(), if listening { Color32::WHITE } else { TEXT });
+        if listening {
+            let t = ui.ctx().input(|i| i.time);
+            let a = (0.5 + 0.5 * (t * 4.0).sin()) as f32;
+            p.circle_stroke(m.center(), mic / 2.0 + 4.0, Stroke::new(2.0, DELETE.gamma_multiply(a)));
+            p.text(pos2(m.center().x, m.bottom() + 8.0), Align2::CENTER_TOP, "Listening", font(10.5), DELETE);
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(33));
+        }
+        if click.clicked() {
+            let ctx = ui.ctx().clone();
+            self.toggle_mic(&ctx);
+        }
     }
 
     fn draw_review(&mut self, ui: &mut egui::Ui, full: Rect) {
@@ -830,13 +1271,20 @@ impl App {
             self.screen = Screen::Cull;
             return;
         }
-        let files: usize = marked.iter().map(|&i| self.photos[i].files.len()).sum();
-        let bytes: u64 = marked.iter().map(|&i| self.photos[i].bytes).sum();
+        let removals: Vec<Vec<(PathBuf, u64)>> = marked.iter().map(|&i| self.removal(i)).collect();
+        let files: usize = removals.iter().map(Vec::len).sum();
+        let bytes: u64 = removals.iter().flatten().map(|f| f.1).sum();
+        let whole = marked.iter().filter(|&&i| self.decision(i) == Some(Decision::Delete)).count();
+        let halves = marked.len() - whole;
         let head = Rect::from_min_max(pos2(full.left(), full.top() + TOP_H), pos2(full.right(), full.top() + TOP_H + 104.0));
         p.text(
             pos2(head.left() + 28.0, head.top() + 30.0),
             Align2::LEFT_CENTER,
-            format!("Delete {} photos permanently?", marked.len()),
+            match (whole, halves) {
+                (d, 0) => format!("Delete {d} photos permanently?"),
+                (0, h) => format!("Drop the RAW or JPEG copy of {h} photos permanently?"),
+                (d, h) => format!("Delete {d} photos and drop copies of {h} more permanently?"),
+            },
             font(22.0),
             TEXT,
         );
@@ -890,9 +1338,20 @@ impl App {
                     p.image(t.id(), Rect::from_center_size(img.center(), ts * s), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), Color32::WHITE);
                 }
                 p.text(pos2(rect.center().x, rect.bottom() - 10.0), Align2::CENTER_CENTER, &ph.name, font(11.0), DIM);
+                let action = match self.decision(i) {
+                    Some(Decision::KeepJpeg) => Some("drop RAW"),
+                    Some(Decision::KeepRaw) => Some("drop JPEG"),
+                    _ => None,
+                };
+                if let Some(a) = action {
+                    let galley = p.layout_no_wrap(a.into(), font(11.0), Color32::BLACK);
+                    let tag = Rect::from_min_size(rect.min + vec2(6.0, 6.0), galley.size() + vec2(12.0, 6.0));
+                    p.rect_filled(tag, 0.0, DELETE);
+                    p.galley(tag.min + vec2(6.0, 3.0), galley, Color32::BLACK);
+                }
                 if resp.hovered() {
                     p.rect_stroke(rect, 0.0, Stroke::new(2.0, KEEP), StrokeKind::Inside);
-                    p.text(rect.center(), Align2::CENTER_CENTER, "Keep", font(16.0), KEEP);
+                    p.text(rect.center(), Align2::CENTER_CENTER, if action.is_some() { "Keep both" } else { "Keep" }, font(16.0), KEEP);
                 }
                 if resp.clicked() {
                     unmark = Some(i);
@@ -932,6 +1391,8 @@ fn draw_help(p: &egui::Painter, full: Rect) {
         ("←  ⇧Space", "Previous photo"),
         ("↑  K", "Keep, then next"),
         ("↓  X  D", "Mark for deletion, then next"),
+        ("J  R", "RAW + JPEG pair: keep only the JPEG / only the RAW"),
+        ("E  V", "Fix with Claude: type or say what's wrong. ⌘D toggles the mic."),
         ("U", "Clear the decision"),
         ("⌫  ⌘Z", "Undo the last decision"),
         ("Z  click", "Zoom to 100%. Move the pointer to pan."),
@@ -954,6 +1415,22 @@ fn draw_help(p: &egui::Painter, full: Rect) {
         p.text(pos2(r.left() + 28.0, y), Align2::LEFT_CENTER, *key, font(14.0), ACCENT);
         p.text(pos2(r.left() + 200.0, y), Align2::LEFT_CENTER, *what, font(14.0), TEXT);
     }
+}
+
+/// A microphone: capsule, cradle and stand.
+fn draw_mic_glyph(p: &egui::Painter, c: Pos2, color: Color32) {
+    let capsule = Rect::from_center_size(c - vec2(0.0, 3.0), vec2(8.0, 13.0));
+    p.rect_filled(capsule, CornerRadius::same(4), color);
+    let s = Stroke::new(1.6, color);
+    let arc: Vec<Pos2> = (0..=12)
+        .map(|k| {
+            let a = std::f32::consts::PI * k as f32 / 12.0;
+            c + vec2(-7.0 * a.cos(), 7.0 * a.sin() - 2.0)
+        })
+        .collect();
+    p.add(egui::Shape::line(arc, s));
+    p.line_segment([c + vec2(0.0, 5.0), c + vec2(0.0, 9.0)], s);
+    p.line_segment([c + vec2(-4.0, 9.0), c + vec2(4.0, 9.0)], s);
 }
 
 fn tilde(p: &Path) -> String {

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>             <string>com.ramihmd.flick.listen</string>
+    <key>CFBundleName</key>                   <string>flick-listen</string>
+    <key>NSMicrophoneUsageDescription</key>   <string>Flick listens while you tell Claude how to fix a photo.</string>
+    <key>NSSpeechRecognitionUsageDescription</key> <string>Flick turns what you say into the request it sends to Claude.</string>
+</dict>
+</plist>

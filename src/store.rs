@@ -11,6 +11,16 @@ use serde::{Deserialize, Serialize};
 pub enum Decision {
     Keep,
     Delete,
+    /// Keep the JPEG, delete the raw half of a RAW + JPEG pair.
+    KeepJpeg,
+    /// Keep the raw, delete the JPEG half of a RAW + JPEG pair.
+    KeepRaw,
+}
+
+impl Decision {
+    pub fn keeps(self) -> bool {
+        self != Decision::Delete
+    }
 }
 
 fn dir() -> PathBuf {
