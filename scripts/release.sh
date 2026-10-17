@@ -28,8 +28,9 @@ app="target/Flick.app"
 codesign --force --timestamp --options runtime --sign "$identity" "$app/Contents/MacOS/flick-segment"
 # The hardened runtime blocks the microphone without this entitlement.
 codesign --force --timestamp --options runtime --entitlements tools/listen.entitlements --sign "$identity" "$app/Contents/MacOS/flick-listen"
-# Also on the app: macOS attributes the helper's mic use to Flick.
-codesign --force --timestamp --options runtime --entitlements tools/listen.entitlements --sign "$identity" "$app"
+# The app also has the mic entitlement, since macOS attributes the helper's mic use to Flick,
+# and Apple Events, to make albums in Photos.
+codesign --force --timestamp --options runtime --entitlements tools/app.entitlements --sign "$identity" "$app"
 codesign --verify --strict "$app"
 
 stage="target/dmg"

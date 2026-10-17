@@ -51,6 +51,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>LSApplicationCategoryType</key>  <string>public.app-category.photography</string>
     <key>NSMicrophoneUsageDescription</key> <string>Flick listens while you tell Claude how to fix a photo.</string>
     <key>NSSpeechRecognitionUsageDescription</key> <string>Flick turns what you say into the request it sends to Claude.</string>
+    <key>NSAppleEventsUsageDescription</key> <string>Flick adds the photos you pick to a new album in Photos.</string>
 </dict>
 </plist>
 PLIST

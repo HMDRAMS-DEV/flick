@@ -83,3 +83,14 @@ pub fn cards() -> Vec<PathBuf> {
     v.sort();
     v
 }
+
+/// The folder the "drive" export copies into, once picked.
+pub fn drive_folder() -> Option<PathBuf> {
+    std::fs::read(dir().join("drive.json")).ok().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+pub fn set_drive_folder(p: &Path) {
+    if let Ok(b) = serde_json::to_vec(p) {
+        let _ = std::fs::write(dir().join("drive.json"), b);
+    }
+}

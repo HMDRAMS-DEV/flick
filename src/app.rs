@@ -10,6 +10,7 @@ use eframe::egui::{
 };
 
 use crate::decode::{Meta, Size};
+use crate::export;
 use crate::fix::{self, Params};
 use crate::library::{self, Kind, Photo, human_bytes};
 use crate::loader::{Job, Loader};
@@ -91,7 +92,17 @@ enum FixMsg {
 enum Screen {
     Start,
     Cull,
+    /// Every photo at once, for picking what to export.
+    Grid,
     Review,
+}
+
+/// Where the selected photos go.
+enum Dest {
+    Photos(String),
+    Dropbox,
+    /// `choose` asks for the folder even when one was picked before.
+    Drive { choose: bool },
 }
 
 pub struct App {
@@ -106,6 +117,18 @@ pub struct App {
     zoom: bool,
     help: bool,
     fix: Option<Fix>,
+    /// Photos picked for export, by id.
+    selected: HashSet<u32>,
+    /// Where a ⇧ run started, and the selection before it; the run is added to that.
+    anchor: Option<(usize, HashSet<u32>)>,
+    /// The Photos album name being typed.
+    naming: Option<String>,
+    /// Exports in progress: what each is doing, and its result line.
+    exports: Vec<(String, Receiver<Result<String, String>>)>,
+    grid_cols: usize,
+    grid_visible: (usize, usize),
+    /// Scroll the grid to the current photo after a key moved it.
+    grid_follow: bool,
     /// When the current photo last changed; full resolution is prefetched once it settles.
     cur_since: f64,
 
@@ -140,6 +163,13 @@ impl App {
             zoom: false,
             help: false,
             fix: None,
+            selected: HashSet::new(),
+            anchor: None,
+            naming: None,
+            exports: vec![],
+            grid_cols: 1,
+            grid_visible: (0, 0),
+            grid_follow: false,
             cur_since: 0.0,
             loader: Loader::new(cc.egui_ctx.clone()),
             requested: HashSet::new(),
@@ -190,6 +220,9 @@ impl App {
         self.undo.clear();
         self.zoom = false;
         self.fix = None;
+        self.selected.clear();
+        self.anchor = None;
+        self.naming = None;
         self.decisions = store::load_decisions(&root);
         self.photos = photos;
         self.reindex();
@@ -210,6 +243,9 @@ impl App {
     fn close(&mut self) {
         self.screen = Screen::Start;
         self.fix = None;
+        self.selected.clear();
+        self.anchor = None;
+        self.naming = None;
         self.photos.clear();
         self.root = None;
         self.cards = store::cards();
@@ -298,6 +334,7 @@ impl App {
             self.cur = i;
             self.zoom = false;
             self.cur_since = 0.0;
+            self.anchor = None;
         }
     }
 
@@ -380,6 +417,8 @@ impl App {
             self.decisions.remove(&p.key);
         }
         self.photos.retain(|p| !removed.contains(&p.id));
+        self.selected.retain(|id| !removed.contains(id));
+        self.anchor = None;
         for id in &removed {
             self.thumbs.remove(id);
             self.previews.remove(id);
@@ -480,6 +519,11 @@ impl App {
             for &i in m.iter().skip(self.review_visible.0).take(self.review_visible.1) {
                 push(&mut wish, i, Size::Thumb);
             }
+        } else if self.screen == Screen::Grid {
+            let (lo, k) = self.grid_visible;
+            for i in lo..lo + k {
+                push(&mut wish, i, Size::Thumb);
+            }
         } else if n > 0 {
             let c = self.cur;
             if self.zoom {
@@ -541,7 +585,7 @@ impl App {
             self.open(path, ctx);
             return;
         }
-        let asking = self.asking();
+        let asking = self.asking() || self.naming.is_some();
         for ev in events {
             match ev {
                 Event::Text(t) if t == "?" && !asking => self.help = !self.help,
@@ -554,6 +598,12 @@ impl App {
     }
 
     fn key(&mut self, ctx: &egui::Context, key: Key, repeat: bool, m: egui::Modifiers) {
+        if self.naming.is_some() {
+            if !repeat {
+                self.key_name(ctx, key);
+            }
+            return;
+        }
         // While writing a request, letters are text, not shortcuts.
         if self.asking() {
             if !repeat {
@@ -588,8 +638,16 @@ impl App {
             return;
         }
 
+        if matches!(self.screen, Screen::Cull | Screen::Grid) && !self.photos.is_empty() && self.key_select(ctx, key, repeat, m) {
+            return;
+        }
+
         match self.screen {
             Screen::Start => self.key_start(ctx, key),
+            Screen::Grid => match key {
+                Key::W if m.command => self.close(),
+                _ => self.key_grid(key, m),
+            },
             Screen::Review => match key {
                 Key::Escape | Key::Backspace => self.screen = Screen::Cull,
                 Key::Enter if !repeat => self.delete_marked(),
@@ -616,6 +674,10 @@ impl App {
                     Key::Z if m.command => self.undo(),
                     Key::Backspace if !m.command => self.undo(),
                     Key::Z => self.zoom = !self.zoom,
+                    Key::G => {
+                        self.screen = Screen::Grid;
+                        self.grid_follow = true;
+                    }
                     Key::Tab => self.next_undecided(!m.shift),
                     Key::Home => self.go(0),
                     Key::End => self.go(usize::MAX),
@@ -847,6 +909,188 @@ impl App {
         self.flash(format!("Saved {}", path.file_name().unwrap_or_default().to_string_lossy()));
     }
 
+    // ---------- selection and export ----------
+
+    fn toggle_selected(&mut self, i: usize) {
+        let Some(id) = self.photos.get(i).map(|p| p.id) else { return };
+        if !self.selected.remove(&id) {
+            self.selected.insert(id);
+        }
+        self.anchor = Some((i, self.selected.clone()));
+    }
+
+    /// Moves by `delta` and selects every photo from the anchor to here, on top of what was
+    /// selected before the run started.
+    fn extend(&mut self, delta: isize) {
+        if self.photos.is_empty() || self.fix.is_some() {
+            return;
+        }
+        let anchor = self.anchor.take().unwrap_or_else(|| (self.cur, self.selected.clone()));
+        let n = self.photos.len() as isize;
+        self.go((self.cur as isize + delta).clamp(0, n - 1) as usize);
+        self.select_run(anchor, self.cur);
+    }
+
+    fn select_run(&mut self, anchor: (usize, HashSet<u32>), to: usize) {
+        let (a, b) = (anchor.0.min(to), anchor.0.max(to).min(self.photos.len().saturating_sub(1)));
+        self.selected = anchor.1.clone();
+        self.selected.extend(self.photos[a..=b].iter().map(|p| p.id));
+        self.anchor = Some(anchor);
+    }
+
+    /// Every photo not marked for deletion.
+    fn select_kept(&mut self) {
+        self.selected = self.photos.iter().filter(|p| self.decisions.get(&p.key) != Some(&Decision::Delete)).map(|p| p.id).collect();
+        self.anchor = None;
+    }
+
+    /// Selected photos to export, in capture order. Photos marked for deletion are left out.
+    fn to_export(&self) -> Vec<usize> {
+        (0..self.photos.len())
+            .filter(|&i| self.selected.contains(&self.photos[i].id) && self.decision(i) != Some(Decision::Delete))
+            .collect()
+    }
+
+    fn drive_folder(&self) -> Option<PathBuf> {
+        store::drive_folder().filter(|p| p.is_dir())
+    }
+
+    fn export(&mut self, ctx: &egui::Context, dest: Dest) {
+        let shots = self.to_export();
+        if shots.is_empty() {
+            let why = if self.selected.is_empty() { "Select photos first: ⇧← →, S, ⌘A, or G for the grid." } else { "The selected photos are all marked for deletion." };
+            self.flash(why);
+            return;
+        }
+        // Photos gets one picture per shot. Backups get every file the shot keeps.
+        let backup = || -> Vec<PathBuf> {
+            shots
+                .iter()
+                .flat_map(|&i| {
+                    let gone: Vec<PathBuf> = self.removal(i).into_iter().map(|f| f.0).collect();
+                    self.photos[i].files.iter().map(|f| f.0.clone()).filter(move |f| !gone.contains(f))
+                })
+                .collect()
+        };
+        let (label, job): (String, Box<dyn FnOnce() -> Result<String, String> + Send>) = match dest {
+            Dest::Photos(name) => {
+                let files: Vec<PathBuf> = shots.iter().map(|&i| self.photos[i].shown().0.to_path_buf()).collect();
+                (format!("Adding {} photos to Photos…", files.len()), Box::new(move || export::to_photos(&name, &files)))
+            }
+            Dest::Dropbox => {
+                let Some(dir) = export::camera_uploads() else {
+                    self.flash("Dropbox is not set up on this Mac.");
+                    return;
+                };
+                let files = backup();
+                (format!("Copying {} files to Dropbox…", files.len()), Box::new(move || export::copy_into(&dir, &files)))
+            }
+            Dest::Drive { choose } => {
+                let dir = match self.drive_folder().filter(|_| !choose) {
+                    Some(d) => d,
+                    None => {
+                        let Some(d) = rfd::FileDialog::new().set_title("Choose a backup folder").set_directory("/Volumes").pick_folder() else { return };
+                        store::set_drive_folder(&d);
+                        d
+                    }
+                };
+                let files = backup();
+                (format!("Copying {} files to {}…", files.len(), tilde(&dir)), Box::new(move || export::copy_into(&dir, &files)))
+            }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+            ctx.request_repaint();
+        });
+        self.flash(label.clone());
+        self.exports.push((label, rx));
+    }
+
+    fn pump_exports(&mut self) {
+        let mut done = vec![];
+        self.exports.retain(|(_, rx)| match rx.try_recv() {
+            Ok(r) => {
+                done.push(r.unwrap_or_else(|e| e));
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+        });
+        for msg in done {
+            self.flash(msg);
+        }
+    }
+
+    /// Selection and export keys, shared by the cull and grid screens. True if `key` was one.
+    fn key_select(&mut self, ctx: &egui::Context, key: Key, repeat: bool, m: egui::Modifiers) -> bool {
+        match key {
+            Key::ArrowRight if m.shift => self.extend(1),
+            Key::ArrowLeft if m.shift => self.extend(-1),
+            _ if repeat => return false,
+            Key::S => self.toggle_selected(self.cur),
+            Key::A if m.command => self.select_kept(),
+            Key::Escape if !self.selected.is_empty() && self.screen == Screen::Cull && !self.zoom => {
+                self.selected.clear();
+                self.anchor = None;
+            }
+            Key::Num1 => {
+                if self.to_export().is_empty() {
+                    self.export(ctx, Dest::Photos(String::new()));
+                } else {
+                    self.naming = Some(String::new());
+                }
+            }
+            Key::Num2 => self.export(ctx, Dest::Dropbox),
+            Key::Num3 => self.export(ctx, Dest::Drive { choose: m.alt }),
+            _ => return false,
+        }
+        true
+    }
+
+    fn key_name(&mut self, ctx: &egui::Context, key: Key) {
+        match key {
+            Key::Escape => self.naming = None,
+            Key::Enter => {
+                let Some(name) = self.naming.take() else { return };
+                let name = match name.trim() {
+                    "" => self.root.as_ref().and_then(|r| r.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "Flick".into()),
+                    n => n.to_string(),
+                };
+                self.export(ctx, Dest::Photos(name));
+            }
+            _ => {}
+        }
+    }
+
+    fn key_grid(&mut self, key: Key, m: egui::Modifiers) {
+        let cols = self.grid_cols.max(1) as isize;
+        let delta = match key {
+            Key::ArrowRight => 1,
+            Key::ArrowLeft => -1,
+            Key::ArrowDown => cols,
+            Key::ArrowUp => -cols,
+            Key::Space => {
+                self.toggle_selected(self.cur);
+                return;
+            }
+            Key::Enter | Key::G | Key::Escape => {
+                self.screen = Screen::Cull;
+                return;
+            }
+            Key::Home => -(self.photos.len() as isize),
+            Key::End => self.photos.len() as isize,
+            _ => return,
+        };
+        self.grid_follow = true;
+        if m.shift {
+            self.extend(delta);
+        } else {
+            self.step(delta);
+        }
+    }
+
     fn open_review(&mut self) {
         if self.marked().is_empty() {
             self.flash("Nothing marked for deletion.");
@@ -867,6 +1111,7 @@ impl eframe::App for App {
         }
         self.pump_loader(&ctx);
         self.pump_fix(&ctx);
+        self.pump_exports();
         self.handle_input(&ctx);
 
         let full = ui.max_rect();
@@ -879,12 +1124,19 @@ impl eframe::App for App {
                 (0, 0)
             }
             Screen::Cull => self.draw_cull(ui, full),
+            Screen::Grid => {
+                self.draw_grid(ui, full);
+                (0, 0)
+            }
             Screen::Review => {
                 self.draw_review(ui, full);
                 (0, 0)
             }
         };
         self.draw_top_bar(ui, full);
+        if self.naming.is_some() {
+            self.draw_naming(ui, full);
+        }
         if self.help {
             draw_help(&painter, full);
         }
@@ -946,7 +1198,9 @@ impl App {
         }
         let (k, d, left_n) = self.counts();
         let right = full.right() - 16.0;
+        let selected = if self.selected.is_empty() { String::new() } else { format!("{} selected", self.selected.len()) };
         let parts = [
+            (selected, ACCENT),
             (format!("{left_n} left"), DIM),
             (format!("{d} delete"), if d > 0 { DELETE } else { DIM }),
             (format!("{k} keep"), if k > 0 { KEEP } else { DIM }),
@@ -1141,6 +1395,9 @@ impl App {
                 let c = if d.keeps() { KEEP } else { DELETE };
                 p.rect_filled(Rect::from_min_size(pos2(cell.left(), cell.bottom() + 4.0), vec2(CELL.x, 3.0)), 0.0, c);
             }
+            if self.selected.contains(&pid) {
+                p.rect_filled(Rect::from_min_size(pos2(cell.left(), cell.top() - 7.0), vec2(CELL.x, 3.0)), 0.0, ACCENT);
+            }
             if i == self.cur {
                 p.rect_stroke(cell.expand(2.0), 0.0, Stroke::new(2.0, TEXT), StrokeKind::Outside);
             }
@@ -1169,9 +1426,13 @@ impl App {
             Some(Fix { state: FixState::Saving, .. }) => format!("Saving {}…", self.fix_name()),
             Some(Fix { state: FixState::Failed(_), .. }) => "E / V  try another request      Esc  close".into(),
             Some(_) => "Esc  cancel".into(),
+            None if !self.selected.is_empty() => {
+                self.draw_selection_bar(ui, hint);
+                String::new()
+            }
             None => {
                 let pair = if ph_pair { "J / R  keep JPEG / RAW only      " } else { "" };
-                format!("←  →  browse      ↑ / K  keep      ↓ / X  delete      {pair}E / V  fix with Claude (type / say)      Z  zoom      ⌫  undo      Enter  review & delete      H  help")
+                format!("←  →  browse      ↑ / K  keep      ↓ / X  delete      {pair}E / V  fix with Claude      ⇧← →  select      G  grid      Enter  review & delete      H  help")
             }
         };
         p.text(hint.center(), Align2::CENTER_CENTER, hints, font(12.0), DIM);
@@ -1262,6 +1523,158 @@ impl App {
             let ctx = ui.ctx().clone();
             self.toggle_mic(&ctx);
         }
+    }
+
+    /// The export buttons, in the hint row while photos are selected.
+    fn draw_selection_bar(&mut self, ui: &mut egui::Ui, row: Rect) {
+        let p = ui.painter().clone();
+        let drive = self.drive_folder().and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| "Drive…".into());
+        let buttons = [("1", "Photos album".to_string()), ("2", "Dropbox".into()), ("3", drive)];
+        let f = font(12.0);
+        let key_w = 18.0;
+        let widths: Vec<f32> = buttons.iter().map(|b| p.layout_no_wrap(b.1.clone(), f.clone(), TEXT).size().x + key_w + 28.0).collect();
+        let info = match self.exports.first() {
+            Some((what, _)) => what.clone(),
+            None => format!("{} selected", self.selected.len()),
+        };
+        let rest = "S  select      ⇧← →  select a run      ⌘A  all kept      ⌥3  other folder      Esc  clear";
+        let info_w = p.layout_no_wrap(info.clone(), f.clone(), ACCENT).size().x;
+        let rest_w = p.layout_no_wrap(rest.into(), f.clone(), DIM).size().x;
+        let total = info_w + 24.0 + widths.iter().sum::<f32>() + 8.0 * 2.0 + 24.0 + rest_w;
+        let mut x = row.center().x - total / 2.0;
+        let y = row.center().y;
+        p.text(pos2(x, y), Align2::LEFT_CENTER, info, f.clone(), ACCENT);
+        x += info_w + 24.0;
+        let mut clicked = None;
+        for (k, ((key, label), w)) in buttons.iter().zip(&widths).enumerate() {
+            let r = Rect::from_min_size(pos2(x, y - 11.0), vec2(*w, 22.0));
+            let resp = ui.interact(r, ui.id().with(("export", k)), Sense::click());
+            p.rect_filled(r, 0.0, if resp.hovered() { FAINT } else { Color32::from_gray(40) });
+            p.text(pos2(r.left() + 10.0, y), Align2::LEFT_CENTER, *key, mono(11.0), ACCENT);
+            p.text(pos2(r.left() + 10.0 + key_w, y), Align2::LEFT_CENTER, label, f.clone(), TEXT);
+            if resp.clicked() {
+                clicked = Some((k, ui.ctx().input(|i| i.modifiers.alt)));
+            }
+            x += w + 8.0;
+        }
+        p.text(pos2(x + 16.0, y), Align2::LEFT_CENTER, rest, f, DIM);
+        let ctx = ui.ctx().clone();
+        match clicked {
+            Some((0, _)) => {
+                self.key_select(&ctx, Key::Num1, false, egui::Modifiers::NONE);
+            }
+            Some((1, _)) => self.export(&ctx, Dest::Dropbox),
+            Some((_, alt)) => self.export(&ctx, Dest::Drive { choose: alt }),
+            None => {}
+        }
+    }
+
+    /// Every photo as a thumbnail. Click to select, ⇧click for a run, double-click to open.
+    fn draw_grid(&mut self, ui: &mut egui::Ui, full: Rect) {
+        let p = ui.painter().clone();
+        let hint = Rect::from_min_max(pos2(full.left(), full.bottom() - HINT_H), full.max);
+        p.rect_filled(hint, 0.0, BAR);
+        if self.selected.is_empty() {
+            let text = "Click or S  select      ⇧click / ⇧arrows  select a run      ⌘A  all kept      double-click / Enter  open      G / Esc  back";
+            p.text(hint.center(), Align2::CENTER_CENTER, text, font(12.0), DIM);
+        } else {
+            self.draw_selection_bar(ui, hint);
+        }
+        let grid = Rect::from_min_max(pos2(full.left() + 20.0, full.top() + TOP_H + 12.0), pos2(full.right() - 20.0, hint.top() - 8.0));
+        let cell = vec2(168.0, 126.0);
+        let pitch = cell + vec2(8.0, 8.0);
+        let cols = ((grid.width() + 8.0) / pitch.x).floor().max(1.0) as usize;
+        self.grid_cols = cols;
+        let n = self.photos.len();
+        let rows = n.div_ceil(cols);
+        let follow = std::mem::take(&mut self.grid_follow);
+        let mut clicked = None;
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(grid));
+        egui::ScrollArea::vertical().auto_shrink(false).show(&mut child, |ui| {
+            let (area, _) = ui.allocate_exact_size(vec2(grid.width(), rows as f32 * pitch.y), Sense::hover());
+            let at = |k: usize| Rect::from_min_size(area.min + vec2((k % cols) as f32 * pitch.x, (k / cols) as f32 * pitch.y), cell);
+            if follow {
+                ui.scroll_to_rect(at(self.cur), None);
+            }
+            let clip = ui.clip_rect();
+            let first_row = ((clip.top() - area.top()) / pitch.y).floor().max(0.0) as usize;
+            let vis_rows = (clip.height() / pitch.y).ceil() as usize + 1;
+            let (lo, hi) = ((first_row * cols).min(n), ((first_row + vis_rows) * cols).min(n));
+            self.grid_visible = (lo, hi - lo);
+            let p = ui.painter();
+            for i in lo..hi {
+                let rect = at(i);
+                let ph = &self.photos[i];
+                let resp = ui.interact(rect, ui.id().with(("grid", ph.id)), Sense::click());
+                p.rect_filled(rect, 0.0, BAR);
+                let dec = self.decision(i);
+                if let Some(t) = self.thumbs.get(&ph.id) {
+                    let ts = t.size_vec2();
+                    let img = rect.shrink(4.0);
+                    let s = (img.width() / ts.x).min(img.height() / ts.y);
+                    let tint = if dec == Some(Decision::Delete) { Color32::from_gray(70) } else { Color32::WHITE };
+                    p.image(t.id(), Rect::from_center_size(img.center(), ts * s), Rect::from_min_max(Pos2::ZERO, pos2(1.0, 1.0)), tint);
+                }
+                if let Some(d) = dec {
+                    let c = if d.keeps() { KEEP } else { DELETE };
+                    p.rect_filled(Rect::from_min_size(pos2(rect.left(), rect.bottom() - 3.0), vec2(rect.width(), 3.0)), 0.0, c);
+                }
+                if self.selected.contains(&ph.id) {
+                    p.rect_stroke(rect, 0.0, Stroke::new(3.0, ACCENT), StrokeKind::Inside);
+                    p.circle_filled(rect.right_top() + vec2(-14.0, 14.0), 8.0, ACCENT);
+                } else if resp.hovered() {
+                    p.rect_stroke(rect, 0.0, Stroke::new(1.0, DIM), StrokeKind::Inside);
+                }
+                if i == self.cur {
+                    p.rect_stroke(rect.expand(2.0), 0.0, Stroke::new(2.0, TEXT), StrokeKind::Outside);
+                }
+                if resp.double_clicked() {
+                    clicked = Some((i, None));
+                } else if resp.clicked() {
+                    clicked = Some((i, Some(ui.ctx().input(|i| i.modifiers.shift))));
+                }
+            }
+        });
+        match clicked {
+            Some((i, None)) => {
+                // The first click of the double-click toggled it; undo that, then open.
+                self.toggle_selected(i);
+                self.go(i);
+                self.screen = Screen::Cull;
+            }
+            Some((i, Some(true))) => {
+                let anchor = self.anchor.take().unwrap_or_else(|| (self.cur, self.selected.clone()));
+                self.go(i);
+                self.select_run(anchor, i);
+            }
+            Some((i, Some(false))) => {
+                self.go(i);
+                self.toggle_selected(i);
+            }
+            None => {}
+        }
+    }
+
+    /// The album name box for "Photos album".
+    fn draw_naming(&mut self, ui: &mut egui::Ui, full: Rect) {
+        let count = self.to_export().len();
+        let Some(name) = &mut self.naming else { return };
+        let p = ui.painter().clone();
+        p.rect_filled(full, 0.0, Color32::from_black_alpha(160));
+        let r = Rect::from_center_size(full.center(), vec2(560.0, 170.0));
+        p.rect_filled(r, 0.0, BAR);
+        p.text(r.min + vec2(24.0, 22.0), Align2::LEFT_TOP, format!("New Photos album with {count} photos"), font(16.0), TEXT);
+        let field = Rect::from_min_size(r.min + vec2(24.0, 66.0), vec2(r.width() - 48.0, 34.0));
+        p.rect_filled(field, 0.0, Color32::from_gray(34));
+        let edit = egui::TextEdit::singleline(name)
+            .font(font(15.0))
+            .text_color(TEXT)
+            .hint_text(egui::RichText::new("Album name").color(FAINT))
+            .frame(egui::Frame::NONE)
+            .margin(vec2(10.0, 7.0))
+            .desired_width(field.width());
+        ui.put(field, edit).request_focus();
+        p.text(pos2(r.left() + 24.0, r.bottom() - 26.0), Align2::LEFT_CENTER, "Enter  create      Esc  cancel", font(12.0), DIM);
     }
 
     fn draw_review(&mut self, ui: &mut egui::Ui, full: Rect) {
@@ -1398,6 +1811,9 @@ fn draw_help(p: &egui::Painter, full: Rect) {
         ("Z  click", "Zoom to 100%. Move the pointer to pan."),
         ("Tab  ⇧Tab", "Next / previous undecided photo"),
         ("Home  End", "First / last photo"),
+        ("⇧← →  S", "Select a run of photos / select this one. ⌘A selects all kept."),
+        ("G", "Grid of every photo: click to select, ⇧click for a run"),
+        ("1  2  3", "Selected photos to a new Photos album / Dropbox / your drive"),
         ("Enter", "Review marked photos, then delete them permanently"),
         ("F", "Full screen"),
         ("O", "Open another folder (or drop one on the window)"),
@@ -1433,7 +1849,7 @@ fn draw_mic_glyph(p: &egui::Painter, c: Pos2, color: Color32) {
     p.line_segment([c + vec2(-4.0, 9.0), c + vec2(4.0, 9.0)], s);
 }
 
-fn tilde(p: &Path) -> String {
+pub fn tilde(p: &Path) -> String {
     match dirs::home_dir().and_then(|h| p.strip_prefix(h).ok().map(|r| r.to_path_buf())) {
         Some(r) => format!("~/{}", r.display()),
         None => p.display().to_string(),

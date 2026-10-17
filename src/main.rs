@@ -2,6 +2,7 @@
 
 mod app;
 mod decode;
+mod export;
 mod fix;
 mod library;
 mod loader;

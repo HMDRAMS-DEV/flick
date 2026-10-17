@@ -16,12 +16,13 @@ Open a folder or camera card, then fly through it with the keyboard. ↑ keeps a
 - **1:1 zoom for focus checks.** Z shows true pixels. Move the pointer to pan.
 - **RAW + JPEG are one photo.** `BF_0001.JPG`, `BF_0001.DNG`, and `BF_0001.xmp` are one shot. Deleting removes all of them. To keep only half of a pair, press J to keep the JPEG or R to keep the RAW. The other half goes at the same review step as deletions.
 - **Fix with Claude.** Press E, type what is wrong with the photo, or press V and say it. Claude Code edits it in [RapidRAW](https://github.com/CyberTimon/RapidRAW): exposure, tone, white balance, color by hue, detail, noise reduction, straightening and crop, and masks that limit a change to a person, the sky, or any other part of the photo. It renders its edit and checks the result before answering. Flick shows the result with Claude's reasoning. Press E or V again to ask for changes, hold B to compare with the original, Enter saves it as `BF_0001-fixed.jpg`, and Esc discards it. When the shot has a RAW or DNG, the fix renders from it, so white balance and noise reduction happen in the raw conversion and highlights clipped in the JPEG can come back. The originals are never changed, and the fixed file is deleted with the shot.
+- **Send the keepers on.** Select photos with ⇧← →, S, or the grid (G), or press ⌘A for every photo you didn't mark for deletion. Then 1 makes a new album in Photos with the name you type, 2 copies them to Dropbox's Camera Uploads folder, and 3 copies them to a folder on your drive. Backups copy every file the shot keeps, RAW included, with their original dates, and skip files already there.
 - **Nothing is lost if you quit.** Marks are saved in `~/Library/Application Support/Flick` as you make them, never on the card. Reopen the folder and you're back at the first undecided photo.
 - **Small and native.** One 12 MB universal binary for Apple Silicon and Intel, drawn on the GPU. There's no runtime, no Electron, and no catalog to import into.
 
 ## What Flick leaves out
 
-Flick does one job: deciding what to keep. It has no library, no import step, no ratings or color labels, no manual editing, and no export. Finder, Photos, and your editor already do those well. Keep the photos Flick leaves behind, then open them in whatever you use next.
+Flick does one job: deciding what to keep. It has no library, no import step, no ratings or color labels, and no manual editing. Finder, Photos, and your editor already do those well. Keep the photos Flick leaves behind, then open them in whatever you use next.
 
 ## Install
 
@@ -48,6 +49,13 @@ You can also drop any folder on the window, or press O. A mounted camera card sh
 | E | Fix with Claude: type a request, Enter sends it. Empty means "fix what looks wrong" |
 | V | Fix with Claude, starting with the mic on. ⌘D turns the mic on or off while typing |
 | | On a fix: Enter or ↑ saves, E or V asks for changes, Esc or ↓ discards, hold B for the original |
+| ⇧→ / ⇧← | Select a run of photos. Runs add up |
+| S | Select or unselect this photo |
+| ⌘A | Select every photo not marked for deletion |
+| G | Grid of every photo. Click selects, ⇧click selects a run, double-click opens |
+| 1 | Selected photos to a new Photos album. Type its name, Enter creates it |
+| 2 | Selected photos to Dropbox's Camera Uploads |
+| 3 | Selected photos to your backup folder. The first time, or with ⌥3, pick the folder |
 | U | Clear the decision |
 | ⌫ or ⌘Z | Undo the last decision |
 | Z or click | Zoom to 100%. Move the pointer to pan |
@@ -68,6 +76,12 @@ Flick renders the photo with no edits at 1568 px and runs `claude -p` with the R
 The first object mask downloads Segment Anything (about 460 MB, from Hugging Face) to `~/Library/Caches/Flick/models`, which takes about 900 MB once compiled for your Mac. Masking runs on your Mac. The "main subject" mask needs macOS 14 or later.
 
 Dictation runs in the bundled `flick-listen` helper with Apple's speech recognizer, on-device when the language model is installed. The first time you press V or ⌘D, macOS asks for Microphone and Speech Recognition access for Flick. If you decline, turn them on in System Settings > Privacy & Security.
+
+## Albums and backups
+
+1 imports the photos into a new album in Photos and opens it. macOS has no way for an app to make a shared album, so share it from Photos: select the photos, then Share > Shared Albums. The first time, macOS asks whether Flick may control Photos. A shot with a saved fix goes to Photos as the fixed JPEG.
+
+2 finds Dropbox through `~/.dropbox/info.json` and copies into its `Camera Uploads` folder. 3 copies into the folder you picked, such as one on an external drive, and remembers it. Both copy flat into that folder. A file with the same name and size is already backed up and is skipped; one with the same name but a different size is saved as `NAME (2).JPG`. Photos marked for deletion are never exported, and the half of a RAW + JPEG pair you chose to drop is left out.
 
 ## Deleting is permanent
 
